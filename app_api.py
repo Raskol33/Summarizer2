@@ -4,6 +4,7 @@ from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from langchain.chains.summarize import load_summarize_chain
 from langchain_community.document_loaders import YoutubeLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from youtube_search import YoutubeSearch
 import validators
 import re
@@ -55,18 +56,76 @@ async def summarize_video(req: SummarizeRequest):
     llm = init_llm(req.groq_api_key)
 
     try:
-        loader = YoutubeLoader.from_youtube_url(req.youtube_url, add_video_info=False)
+        loader = YoutubeLoader.from_youtube_url(
+            req.youtube_url,
+            add_video_info=False,
+            language=['fr', 'en', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh-Hans', 'ar', 'hi', 'nl', 'pl', 'tr', 'sv', 'no', 'da', 'fi']
+        )
         docs = loader.load()
         if not docs or not any(doc.page_content.strip() for doc in docs):
             raise HTTPException(status_code=404, detail="No transcript found for this video.")
 
-        prompt_template = """
-        Provide a clear, concise summary (~300 words) of the following content:
+        # Get the full transcript text
+        full_text = " ".join([doc.page_content for doc in docs])
+
+        # Map prompt for individual chunks
+        map_prompt_template = """
+        Provide a detailed summary of the following content section. Capture all key points, important details, and main ideas:
+
         {text}
+
+        DETAILED SUMMARY:
         """
-        prompt = PromptTemplate(template=prompt_template, input_variables=["text"])
-        chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
-        summary = chain.run(docs)
+        map_prompt = PromptTemplate(template=map_prompt_template, input_variables=["text"])
+
+        # Combine prompt for final summary
+        combine_prompt_template = """
+        You are given multiple summaries from different sections of a video. Combine them into one comprehensive, well-structured summary.
+
+        Section summaries:
+        {text}
+
+        FINAL COMPREHENSIVE SUMMARY:
+        """
+        combine_prompt = PromptTemplate(template=combine_prompt_template, input_variables=["text"])
+
+        # Simple chunking without transformers dependency
+        chunk_size = 2500
+        chunks = []
+        for i in range(0, len(full_text), chunk_size):
+            chunk = full_text[i:i + chunk_size]
+            chunks.append(chunk)
+
+        # If the text is short enough, summarize directly
+        if len(full_text) < 3000:
+            result = llm.invoke(map_prompt.format(text=full_text))
+            summary = result.content.strip()
+        else:
+            # Summarize each chunk
+            chunk_summaries = []
+            for chunk in chunks:
+                result = llm.invoke(map_prompt.format(text=chunk))
+                chunk_summaries.append(result.content.strip())
+
+            # Combine all summaries
+            combined_text = "\n\n".join(chunk_summaries)
+
+            # If combined summaries are still long, summarize again
+            if len(combined_text) > 3000:
+                # Recursively summarize the summaries
+                final_chunks = []
+                for i in range(0, len(combined_text), 2500):
+                    final_chunks.append(combined_text[i:i + 2500])
+
+                final_summaries = []
+                for chunk in final_chunks:
+                    result = llm.invoke(combine_prompt.format(text=chunk))
+                    final_summaries.append(result.content.strip())
+
+                summary = " ".join(final_summaries)
+            else:
+                result = llm.invoke(combine_prompt.format(text=combined_text))
+                summary = result.content.strip()
         return {"summary": summary.strip()}
 
     except Exception as e:

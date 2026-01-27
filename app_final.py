@@ -4,8 +4,34 @@ from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from langchain.chains.summarize import load_summarize_chain
 from langchain_community.document_loaders import YoutubeLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from youtube_search import YoutubeSearch
 import re
+import os
+import json
+
+# --------------------------- API KEY PERSISTENCE ---------------------------
+CONFIG_FILE = "config.json"
+
+def load_api_key():
+    """Load API key from config file."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+                return config.get("groq_api_key", "")
+        except:
+            return ""
+    return ""
+
+def save_api_key(api_key):
+    """Save API key to config file."""
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"groq_api_key": api_key}, f)
+        return True
+    except:
+        return False
 
 # --------------------------- PAGE CONFIG ---------------------------
 st.set_page_config(
@@ -279,7 +305,27 @@ st.markdown(
 # --------------------------- SIDEBAR ---------------------------
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
-    groq_api_key = st.text_input("Groq API Key", type="password", value="")
+
+    # Load saved API key
+    saved_key = load_api_key()
+    groq_api_key = st.text_input("Groq API Key", type="password", value=saved_key)
+
+    # Save button
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        if st.button("💾 Save API Key"):
+            if groq_api_key and groq_api_key.startswith("gsk_"):
+                if save_api_key(groq_api_key):
+                    st.success("✅ API Key saved!")
+                else:
+                    st.error("❌ Failed to save key")
+            else:
+                st.warning("⚠️ Enter a valid Groq API key")
+    with col2:
+        if st.button("🗑️ Clear"):
+            save_api_key("")
+            st.rerun()
+
     st.markdown("Get your key at [Groq Console](https://console.groq.com)")
     st.divider()
 
@@ -338,11 +384,33 @@ if valid_api_key:
 else:
     st.info("🔑 Enter your valid **Groq API key** in the sidebar to enable video input and summarization.")
 
-prompt_template = """
-Provide a clear, concise summary (~300 words) of the following content:
+# Prompt for individual chunks (map step)
+map_prompt_template = """
+Provide a detailed summary of the following content section. Capture all key points, important details, and main ideas:
+
 {text}
+
+DETAILED SUMMARY:
 """
-prompt = PromptTemplate(template=prompt_template, input_variables=["text"])
+map_prompt = PromptTemplate(template=map_prompt_template, input_variables=["text"])
+
+# Prompt for combining summaries (reduce step)
+combine_prompt_template = """
+You are given multiple summaries from different sections of a video. Combine them into one comprehensive, well-structured summary.
+
+The final summary should:
+- Be proportional to the total content length and importance
+- Maintain logical flow and coherence
+- Capture all essential information from all sections
+- Include important examples, statistics, or quotes when relevant
+- Be organized and easy to read
+
+Section summaries:
+{text}
+
+FINAL COMPREHENSIVE SUMMARY:
+"""
+combine_prompt = PromptTemplate(template=combine_prompt_template, input_variables=["text"])
 
 # --------------------------- SUMMARIZATION ---------------------------
 # Only show the button and run the logic if the API key is valid
@@ -359,13 +427,59 @@ if valid_api_key:
 
             with st.spinner("⏳ Fetching transcript and generating summary..."):
                 try:
-                    loader = YoutubeLoader.from_youtube_url(youtube_url, add_video_info=False)
+                    # Support for multiple languages - will try in order until one works
+                    loader = YoutubeLoader.from_youtube_url(
+                        youtube_url,
+                        add_video_info=False,
+                        language=['fr', 'en', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh-Hans', 'ar', 'hi', 'nl', 'pl', 'tr', 'sv', 'no', 'da', 'fi']
+                    )
                     docs = loader.load()
                     if not docs or not any(doc.page_content.strip() for doc in docs):
                         st.error("❌ No transcript content available for this video.")
                     else:
-                        chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
-                        summary = chain.run(docs)
+                        # Get the full transcript text
+                        full_text = " ".join([doc.page_content for doc in docs])
+
+                        # Simple chunking without transformers dependency
+                        chunk_size = 2500
+                        chunks = []
+                        for i in range(0, len(full_text), chunk_size):
+                            chunk = full_text[i:i + chunk_size]
+                            chunks.append(chunk)
+
+                        # If the text is short enough, summarize directly
+                        if len(full_text) < 3000:
+                            result = llm.invoke(map_prompt.format(text=full_text))
+                            summary = result.content.strip()
+                        else:
+                            # Summarize each chunk
+                            chunk_summaries = []
+                            progress_bar = st.progress(0)
+                            for idx, chunk in enumerate(chunks):
+                                result = llm.invoke(map_prompt.format(text=chunk))
+                                chunk_summaries.append(result.content.strip())
+                                progress_bar.progress((idx + 1) / len(chunks))
+                            progress_bar.empty()
+
+                            # Combine all summaries
+                            combined_text = "\n\n".join(chunk_summaries)
+
+                            # If combined summaries are still long, summarize again
+                            if len(combined_text) > 3000:
+                                # Recursively summarize the summaries
+                                final_chunks = []
+                                for i in range(0, len(combined_text), 2500):
+                                    final_chunks.append(combined_text[i:i + 2500])
+
+                                final_summaries = []
+                                for chunk in final_chunks:
+                                    result = llm.invoke(combine_prompt.format(text=chunk))
+                                    final_summaries.append(result.content.strip())
+
+                                summary = " ".join(final_summaries)
+                            else:
+                                result = llm.invoke(combine_prompt.format(text=combined_text))
+                                summary = result.content.strip()
                         st.session_state.summary = summary
                         st.session_state.docs = docs
                         st.success("✅ Summary generated successfully!")
@@ -384,7 +498,7 @@ if st.session_state.summary:
 
     # --- Translation ---
     with tab1:
-        lang = st.selectbox("🌍 Choose target language", ["Hindi", "Spanish", "French", "German", "Tamil"], key='t_lang')
+        lang = st.selectbox("🌍 Choose target language", ["English", "French", "Spanish", "German", "Hindi", "Tamil", "Arabic", "Portuguese", "Italian", "Dutch", "Russian", "Chinese", "Japanese", "Korean"], key='t_lang')
 
 
         def translate_action():
@@ -398,7 +512,7 @@ if st.session_state.summary:
             with st.spinner(f"Translating to {lang}..."):
                 try:
                     t_prompt = PromptTemplate(
-                        template="Translate the following English text to {target_language} naturally:\n{text}",
+                        template="Translate the following text to {target_language} naturally and accurately. Preserve the meaning, tone, and structure:\n{text}",
                         input_variables=["text", "target_language"],
                     )
                     result = llm.invoke(t_prompt.format(text=st.session_state.summary, target_language=lang))
@@ -548,7 +662,7 @@ with col2:
         unsafe_allow_html=True)
 with col3:
     st.markdown(
-        "<div class='feature-card'><div class='feature-title'>🌍 Multi-Language Translation</div><div class='feature-text'>Instantly translate summaries into popular global languages like Hindi, Spanish, or French.</div></div>",
+        "<div class='feature-card'><div class='feature-title'>🌍 Multi-Language Translation</div><div class='feature-text'>Instantly translate summaries into 14+ languages including English, French, Spanish, German, Arabic, Chinese, Japanese and more.</div></div>",
         unsafe_allow_html=True)
 with col4:
     st.markdown(
