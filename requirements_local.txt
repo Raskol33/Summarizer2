@@ -1,0 +1,8 @@
+streamlit
+langchain==0.3.27
+langchain-community
+youtube-search
+validators
+youtube-transcript-api
+# Note: groq n'est pas nécessaire pour la version locale
+# La connexion au LLM se fait via Ollama (langchain-community inclus)
