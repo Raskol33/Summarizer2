@@ -910,41 +910,58 @@ if valid_api_key:
                         # Get the full transcript text
                         full_text = " ".join([doc.page_content for doc in docs])
 
-                        # Simple chunking without transformers dependency
-                        chunk_size = 2500
+                        # Simple chunking - reduced size to respect Groq API limits
+                        chunk_size = 1200
                         chunks = []
                         for i in range(0, len(full_text), chunk_size):
                             chunk = full_text[i:i + chunk_size]
                             chunks.append(chunk)
 
                         # If the text is short enough, summarize directly
-                        if len(full_text) < 3000:
+                        if len(full_text) < 2000:
                             result = current_llm.invoke(map_prompt.format(text=full_text))
                             summary = result.content.strip()
                         else:
                             # Summarize each chunk
                             chunk_summaries = []
                             progress_bar = st.progress(0)
+
+                            import time
                             for idx, chunk in enumerate(chunks):
-                                result = current_llm.invoke(map_prompt.format(text=chunk))
-                                chunk_summaries.append(result.content.strip())
-                                progress_bar.progress((idx + 1) / len(chunks))
+                                try:
+                                    result = current_llm.invoke(map_prompt.format(text=chunk))
+                                    chunk_summaries.append(result.content.strip())
+                                    progress_bar.progress((idx + 1) / len(chunks))
+
+                                    # Add delay to avoid rate limits
+                                    if idx < len(chunks) - 1:
+                                        time.sleep(0.5)
+                                except Exception as e:
+                                    if "rate_limit" in str(e).lower():
+                                        st.warning(f"⏳ Rate limit atteint, pause...")
+                                        time.sleep(5)
+                                        result = current_llm.invoke(map_prompt.format(text=chunk))
+                                        chunk_summaries.append(result.content.strip())
+                                    else:
+                                        raise e
                             progress_bar.empty()
 
                             # Combine all summaries
                             combined_text = "\n\n".join(chunk_summaries)
 
                             # If combined summaries are still long, summarize again
-                            if len(combined_text) > 3000:
+                            if len(combined_text) > 2000:
                                 # Recursively summarize the summaries
                                 final_chunks = []
-                                for i in range(0, len(combined_text), 2500):
-                                    final_chunks.append(combined_text[i:i + 2500])
+                                for i in range(0, len(combined_text), 1200):
+                                    final_chunks.append(combined_text[i:i + 1200])
 
                                 final_summaries = []
-                                for chunk in final_chunks:
+                                for idx, chunk in enumerate(final_chunks):
                                     result = current_llm.invoke(combine_prompt.format(text=chunk))
                                     final_summaries.append(result.content.strip())
+                                    if idx < len(final_chunks) - 1:
+                                        time.sleep(0.5)
 
                                 summary = " ".join(final_summaries)
                             else:
@@ -1110,18 +1127,34 @@ if st.session_state.summary:
                     summary_text = st.session_state.summary
 
                     # For long texts, chunk and translate
-                    if len(summary_text) > 3000:
-                        chunk_size = 2500
+                    # Using smaller chunks to respect Groq API token limits
+                    if len(summary_text) > 2000:
+                        chunk_size = 1200
                         chunks = []
                         for i in range(0, len(summary_text), chunk_size):
                             chunks.append(summary_text[i:i + chunk_size])
 
                         translated_chunks = []
                         progress_bar = st.progress(0)
+
+                        import time
                         for idx, chunk in enumerate(chunks):
-                            result = current_llm.invoke(t_prompt.format(text=chunk, target_language=lang))
-                            translated_chunks.append(result.content.strip())
-                            progress_bar.progress((idx + 1) / len(chunks))
+                            try:
+                                result = current_llm.invoke(t_prompt.format(text=chunk, target_language=lang))
+                                translated_chunks.append(result.content.strip())
+                                progress_bar.progress((idx + 1) / len(chunks))
+
+                                # Add delay to avoid rate limits
+                                if idx < len(chunks) - 1:
+                                    time.sleep(1)
+                            except Exception as e:
+                                if "rate_limit" in str(e).lower():
+                                    st.warning(f"⏳ Rate limit atteint, pause de 5 secondes...")
+                                    time.sleep(5)
+                                    result = current_llm.invoke(t_prompt.format(text=chunk, target_language=lang))
+                                    translated_chunks.append(result.content.strip())
+                                else:
+                                    raise e
                         progress_bar.empty()
 
                         st.session_state.translation_output = " ".join(translated_chunks)
@@ -1293,15 +1326,16 @@ if st.session_state.summary:
                     {{text}}
                     """
 
-                    # Simple chunking
-                    chunk_size = 2500
+                    # Simple chunking - reduced size to respect Groq API limits (6000 tokens/min)
+                    # Using 1200 chars (~300 tokens) to stay well under the limit with prompt overhead
+                    chunk_size = 1200
                     chunks = []
                     for i in range(0, len(full_text), chunk_size):
                         chunk = full_text[i:i + chunk_size]
                         chunks.append(chunk)
 
                     # If the text is short enough, generate notes directly
-                    if len(full_text) < 3000:
+                    if len(full_text) < 2000:
                         final_prompt = PromptTemplate(template=final_notes_template, input_variables=["text"])
                         result = current_llm.invoke(final_prompt.format(text=full_text))
                         notes = result.content.strip()
@@ -1310,14 +1344,45 @@ if st.session_state.summary:
                         chunk_prompt = PromptTemplate(template=chunk_prompt_template, input_variables=["text"])
                         chunk_summaries = []
                         progress_bar = st.progress(0)
+
+                        import time
                         for idx, chunk in enumerate(chunks):
-                            result = current_llm.invoke(chunk_prompt.format(text=chunk))
-                            chunk_summaries.append(result.content.strip())
-                            progress_bar.progress((idx + 1) / len(chunks))
+                            try:
+                                result = current_llm.invoke(chunk_prompt.format(text=chunk))
+                                chunk_summaries.append(result.content.strip())
+                                progress_bar.progress((idx + 1) / len(chunks))
+
+                                # Add delay between requests to avoid rate limits (1 second)
+                                if idx < len(chunks) - 1:
+                                    time.sleep(1)
+                            except Exception as e:
+                                if "rate_limit" in str(e).lower():
+                                    st.warning(f"⏳ Rate limit atteint, pause de 5 secondes...")
+                                    time.sleep(5)
+                                    result = current_llm.invoke(chunk_prompt.format(text=chunk))
+                                    chunk_summaries.append(result.content.strip())
+                                else:
+                                    raise e
                         progress_bar.empty()
 
                         # Combine all key info
                         combined_text = "\n\n".join(chunk_summaries)
+
+                        # If combined text is still too long, chunk it again
+                        if len(combined_text) > 2000:
+                            final_chunks = []
+                            for i in range(0, len(combined_text), 1200):
+                                final_chunks.append(combined_text[i:i + 1200])
+
+                            # Summarize the summaries
+                            mini_summaries = []
+                            for idx, chunk in enumerate(final_chunks):
+                                result = current_llm.invoke(chunk_prompt.format(text=chunk))
+                                mini_summaries.append(result.content.strip())
+                                if idx < len(final_chunks) - 1:
+                                    time.sleep(1)
+
+                            combined_text = "\n\n".join(mini_summaries)
 
                         # Generate final structured notes
                         final_prompt = PromptTemplate(template=final_notes_template, input_variables=["text"])

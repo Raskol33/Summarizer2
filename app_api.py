@@ -178,38 +178,52 @@ async def summarize_video(req: SummarizeRequest):
         """
         combine_prompt = PromptTemplate(template=combine_prompt_template, input_variables=["text"])
 
-        # Simple chunking without transformers dependency
-        chunk_size = 2500
+        # Simple chunking - reduced size to respect Groq API limits
+        chunk_size = 1200
         chunks = []
         for i in range(0, len(full_text), chunk_size):
             chunk = full_text[i:i + chunk_size]
             chunks.append(chunk)
 
         # If the text is short enough, summarize directly
-        if len(full_text) < 3000:
+        if len(full_text) < 2000:
             result = llm.invoke(map_prompt.format(text=full_text))
             summary = result.content.strip()
         else:
             # Summarize each chunk
+            import time
             chunk_summaries = []
-            for chunk in chunks:
-                result = llm.invoke(map_prompt.format(text=chunk))
-                chunk_summaries.append(result.content.strip())
+            for idx, chunk in enumerate(chunks):
+                try:
+                    result = llm.invoke(map_prompt.format(text=chunk))
+                    chunk_summaries.append(result.content.strip())
+                    # Add delay to avoid rate limits
+                    if idx < len(chunks) - 1:
+                        time.sleep(0.5)
+                except Exception as e:
+                    if "rate_limit" in str(e).lower():
+                        time.sleep(5)
+                        result = llm.invoke(map_prompt.format(text=chunk))
+                        chunk_summaries.append(result.content.strip())
+                    else:
+                        raise e
 
             # Combine all summaries
             combined_text = "\n\n".join(chunk_summaries)
 
             # If combined summaries are still long, summarize again
-            if len(combined_text) > 3000:
+            if len(combined_text) > 2000:
                 # Recursively summarize the summaries
                 final_chunks = []
-                for i in range(0, len(combined_text), 2500):
-                    final_chunks.append(combined_text[i:i + 2500])
+                for i in range(0, len(combined_text), 1200):
+                    final_chunks.append(combined_text[i:i + 1200])
 
                 final_summaries = []
-                for chunk in final_chunks:
+                for idx, chunk in enumerate(final_chunks):
                     result = llm.invoke(combine_prompt.format(text=chunk))
                     final_summaries.append(result.content.strip())
+                    if idx < len(final_chunks) - 1:
+                        time.sleep(0.5)
 
                 summary = " ".join(final_summaries)
             else:
@@ -238,16 +252,28 @@ async def translate_summary(req: TranslateRequest):
         )
 
         # For long texts, chunk and translate
-        if len(req.summary_text) > 3000:
-            chunk_size = 2500
+        if len(req.summary_text) > 2000:
+            chunk_size = 1200
             chunks = []
             for i in range(0, len(req.summary_text), chunk_size):
                 chunks.append(req.summary_text[i:i + chunk_size])
 
+            import time
             translated_chunks = []
-            for chunk in chunks:
-                result = llm.invoke(prompt.format(text=chunk, target_language=req.target_language))
-                translated_chunks.append(result.content.strip())
+            for idx, chunk in enumerate(chunks):
+                try:
+                    result = llm.invoke(prompt.format(text=chunk, target_language=req.target_language))
+                    translated_chunks.append(result.content.strip())
+                    # Add delay to avoid rate limits
+                    if idx < len(chunks) - 1:
+                        time.sleep(1)
+                except Exception as e:
+                    if "rate_limit" in str(e).lower():
+                        time.sleep(5)
+                        result = llm.invoke(prompt.format(text=chunk, target_language=req.target_language))
+                        translated_chunks.append(result.content.strip())
+                    else:
+                        raise e
 
             translation = " ".join(translated_chunks)
         else:
@@ -310,21 +336,49 @@ async def generate_notes(req: NotesRequest):
         full_text = req.transcript_text
 
         # For long texts, use chunking
-        if len(full_text) > 3000:
-            chunk_size = 2500
+        if len(full_text) > 2000:
+            chunk_size = 1200
             chunks = []
             for i in range(0, len(full_text), chunk_size):
                 chunks.append(full_text[i:i + chunk_size])
 
             # Extract key info from each chunk
+            import time
             chunk_prompt = PromptTemplate(template=chunk_prompt_template, input_variables=["text"])
             chunk_summaries = []
-            for chunk in chunks:
-                result = llm.invoke(chunk_prompt.format(text=chunk))
-                chunk_summaries.append(result.content.strip())
+            for idx, chunk in enumerate(chunks):
+                try:
+                    result = llm.invoke(chunk_prompt.format(text=chunk))
+                    chunk_summaries.append(result.content.strip())
+                    # Add delay to avoid rate limits
+                    if idx < len(chunks) - 1:
+                        time.sleep(1)
+                except Exception as e:
+                    if "rate_limit" in str(e).lower():
+                        time.sleep(5)
+                        result = llm.invoke(chunk_prompt.format(text=chunk))
+                        chunk_summaries.append(result.content.strip())
+                    else:
+                        raise e
 
             # Combine all key info
             combined_text = "\n\n".join(chunk_summaries)
+
+            # If combined text is still too long, chunk it again
+            if len(combined_text) > 2000:
+                final_chunks = []
+                for i in range(0, len(combined_text), 1200):
+                    final_chunks.append(combined_text[i:i + 1200])
+
+                # Summarize the summaries
+                mini_summaries = []
+                for idx, chunk in enumerate(final_chunks):
+                    result = llm.invoke(chunk_prompt.format(text=chunk))
+                    mini_summaries.append(result.content.strip())
+                    if idx < len(final_chunks) - 1:
+                        time.sleep(1)
+
+                combined_text = "\n\n".join(mini_summaries)
 
             # Generate final structured notes
             notes_prompt = PromptTemplate(template=notes_prompt_template, input_variables=["text"])
