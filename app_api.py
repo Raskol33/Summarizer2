@@ -9,6 +9,7 @@ from youtube_search import YoutubeSearch
 import validators
 import re
 from langchain.schema import Document
+from llm_factory import create_llm, validate_api_key, get_default_model
 
 # --------------------------- APP CONFIG ---------------------------
 app = FastAPI(
@@ -20,30 +21,109 @@ app = FastAPI(
 # --------------------------- REQUEST MODELS ---------------------------
 class SummarizeRequest(BaseModel):
     youtube_url: str
-    groq_api_key: str
+    provider: str = "groq"  # Default to Groq for backward compatibility
+    api_key: str = None
+    model: str = None  # Uses default if None
+    # For Ollama only
+    ollama_url: str = "http://localhost:11434"
+    # Backward compatibility
+    groq_api_key: str = None  # Deprecated, use api_key
+
+    def __init__(self, **data):
+        # Migrate groq_api_key → api_key for backward compatibility
+        if data.get('groq_api_key') and not data.get('api_key'):
+            data['api_key'] = data['groq_api_key']
+            data['provider'] = 'groq'
+        super().__init__(**data)
 
 
 class TranslateRequest(BaseModel):
     summary_text: str
     target_language: str
-    groq_api_key: str
+    provider: str = "groq"
+    api_key: str = None
+    model: str = None
+    ollama_url: str = "http://localhost:11434"
+    groq_api_key: str = None  # Deprecated
+
+    def __init__(self, **data):
+        if data.get('groq_api_key') and not data.get('api_key'):
+            data['api_key'] = data['groq_api_key']
+            data['provider'] = 'groq'
+        super().__init__(**data)
 
 
 class NotesRequest(BaseModel):
     transcript_text: str
-    groq_api_key: str
+    provider: str = "groq"
+    api_key: str = None
+    model: str = None
+    ollama_url: str = "http://localhost:11434"
+    groq_api_key: str = None  # Deprecated
+
+    def __init__(self, **data):
+        if data.get('groq_api_key') and not data.get('api_key'):
+            data['api_key'] = data['groq_api_key']
+            data['provider'] = 'groq'
+        super().__init__(**data)
 
 
 class RecommendationsRequest(BaseModel):
     summary_text: str
+    # No LLM needed for recommendations
 
 
 # --------------------------- CORE UTILS ---------------------------
-def init_llm(api_key: str):
-    """Initialize the ChatGroq model."""
-    if not api_key.startswith("gsk_"):
-        raise HTTPException(status_code=400, detail="Invalid Groq API key.")
-    return ChatGroq(model="llama-3.1-8b-instant", groq_api_key=api_key)
+def init_llm(provider: str, api_key: str = None, model: str = None, **kwargs):
+    """
+    Initialize LLM based on provider.
+
+    Args:
+        provider: "groq", "openai", "claude", "mistral", or "ollama"
+        api_key: API key (not needed for Ollama)
+        model: Model name (uses default if None)
+        **kwargs: Provider-specific params (e.g., ollama_url)
+
+    Returns:
+        Configured LLM instance
+
+    Raises:
+        HTTPException: If validation fails
+    """
+    try:
+        # Ollama doesn't require API key
+        if provider == "ollama":
+            base_url = kwargs.get('ollama_url', 'http://localhost:11434')
+            model = model or get_default_model("ollama")
+            return create_llm("ollama", model=model, base_url=base_url)
+
+        # Other providers: validate API key
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"API key required for {provider.upper()}"
+            )
+
+        if not validate_api_key(provider, api_key):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {provider.upper()} API key format"
+            )
+
+        # Use default model if not specified
+        model = model or get_default_model(provider)
+
+        return create_llm(provider, api_key=api_key, model=model)
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"LLM initialization failed: {str(e)}"
+        )
 
 
 # --------------------------- ENDPOINT: Summarize ---------------------------
@@ -53,7 +133,12 @@ async def summarize_video(req: SummarizeRequest):
     if not validators.url(req.youtube_url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL.")
 
-    llm = init_llm(req.groq_api_key)
+    llm = init_llm(
+        provider=req.provider,
+        api_key=req.api_key,
+        model=req.model,
+        ollama_url=req.ollama_url
+    )
 
     try:
         loader = YoutubeLoader.from_youtube_url(
@@ -70,22 +155,26 @@ async def summarize_video(req: SummarizeRequest):
 
         # Map prompt for individual chunks
         map_prompt_template = """
+        CRITICAL INSTRUCTION: You MUST write your summary in the SAME LANGUAGE as the content below. If the content is in French, write in French. If in English, write in English. DO NOT switch languages.
+
         Provide a detailed summary of the following content section. Capture all key points, important details, and main ideas:
 
         {text}
 
-        DETAILED SUMMARY:
+        DETAILED SUMMARY (in the same language as the content above):
         """
         map_prompt = PromptTemplate(template=map_prompt_template, input_variables=["text"])
 
         # Combine prompt for final summary
         combine_prompt_template = """
+        CRITICAL INSTRUCTION: You MUST write your final summary in the SAME LANGUAGE as the summaries below. DO NOT translate or switch languages. Maintain the original language throughout.
+
         You are given multiple summaries from different sections of a video. Combine them into one comprehensive, well-structured summary.
 
         Section summaries:
         {text}
 
-        FINAL COMPREHENSIVE SUMMARY:
+        FINAL COMPREHENSIVE SUMMARY (in the same language as above):
         """
         combine_prompt = PromptTemplate(template=combine_prompt_template, input_variables=["text"])
 
@@ -136,14 +225,36 @@ async def summarize_video(req: SummarizeRequest):
 @app.post("/translate")
 async def translate_summary(req: TranslateRequest):
     """Translate summary text to a target language."""
-    llm = init_llm(req.groq_api_key)
+    llm = init_llm(
+        provider=req.provider,
+        api_key=req.api_key,
+        model=req.model,
+        ollama_url=req.ollama_url
+    )
     try:
         prompt = PromptTemplate(
-            template="Translate the following English text to {target_language} naturally:\n{text}",
+            template="Translate the following text to {target_language} naturally and accurately. Preserve the meaning, tone, and structure:\n{text}",
             input_variables=["text", "target_language"],
         )
-        result = llm.invoke(prompt.format(text=req.summary_text, target_language=req.target_language))
-        return {"translation": result.content.strip()}
+
+        # For long texts, chunk and translate
+        if len(req.summary_text) > 3000:
+            chunk_size = 2500
+            chunks = []
+            for i in range(0, len(req.summary_text), chunk_size):
+                chunks.append(req.summary_text[i:i + chunk_size])
+
+            translated_chunks = []
+            for chunk in chunks:
+                result = llm.invoke(prompt.format(text=chunk, target_language=req.target_language))
+                translated_chunks.append(result.content.strip())
+
+            translation = " ".join(translated_chunks)
+        else:
+            result = llm.invoke(prompt.format(text=req.summary_text, target_language=req.target_language))
+            translation = result.content.strip()
+
+        return {"translation": translation}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
@@ -152,38 +263,78 @@ async def translate_summary(req: TranslateRequest):
 @app.post("/notes")
 async def generate_notes(req: NotesRequest):
     """Generate detailed study notes from transcript text."""
-    llm = init_llm(req.groq_api_key)
+    llm = init_llm(
+        provider=req.provider,
+        api_key=req.api_key,
+        model=req.model,
+        ollama_url=req.ollama_url
+    )
     try:
-        notes_prompt = PromptTemplate(
-            template="""
-            From the content provided below, create detailed, structured study notes.
+        # Prompt for extracting key info from chunks
+        chunk_prompt_template = """
+        Extract key information from the following content section.
+        List the main topics, important points, and insights.
 
-            # 🔑 Key Topics
-            * 3–5 main topics covered.
+        Content:
+        {text}
 
-            # 💡 Main Takeaways
-            * 3 concise takeaways.
+        Key information:
+        """
 
-            # 📝 Detailed Insights
-            1. Provide detailed numbered insights.
+        # Final notes prompt
+        notes_prompt_template = """
+        From the information provided below, create detailed, structured study notes.
 
-            # 🚀 Actionable Steps
-            * 2–3 actions a viewer can take.
+        **Strictly adhere to the following formatting rules, using Markdown for headings and lists.**
 
-            Content:
-            {text}
-            """,
-            input_variables=["text"],
-        )
+        # 🔑 Key Topics
+        * List 3-5 main topics covered.
 
-        # ✅ Wrap transcript text into a LangChain Document object
-        docs = [Document(page_content=req.transcript_text)]
+        # 💡 Main Takeaways
+        * List 3 concise, most important takeaways.
 
-        # Create summarization chain
-        chain = load_summarize_chain(llm, chain_type="stuff", prompt=notes_prompt)
+        # 📝 Detailed Insights
+        1. Use numbered list for detailed insights, explaining each point in a complete sentence.
+        2. Ensure at least 4 detailed insights are provided.
 
-        # Run the chain properly
-        notes = chain.run(docs)
+        # 🚀 Actionable Steps
+        * List 2-3 specific actions a user can take based on the content.
+
+        Generate the result in a proper format.
+        ---
+
+        Information to organize:
+        {text}
+        """
+
+        full_text = req.transcript_text
+
+        # For long texts, use chunking
+        if len(full_text) > 3000:
+            chunk_size = 2500
+            chunks = []
+            for i in range(0, len(full_text), chunk_size):
+                chunks.append(full_text[i:i + chunk_size])
+
+            # Extract key info from each chunk
+            chunk_prompt = PromptTemplate(template=chunk_prompt_template, input_variables=["text"])
+            chunk_summaries = []
+            for chunk in chunks:
+                result = llm.invoke(chunk_prompt.format(text=chunk))
+                chunk_summaries.append(result.content.strip())
+
+            # Combine all key info
+            combined_text = "\n\n".join(chunk_summaries)
+
+            # Generate final structured notes
+            notes_prompt = PromptTemplate(template=notes_prompt_template, input_variables=["text"])
+            result = llm.invoke(notes_prompt.format(text=combined_text))
+            notes = result.content.strip()
+        else:
+            # For short texts, generate notes directly
+            notes_prompt = PromptTemplate(template=notes_prompt_template, input_variables=["text"])
+            result = llm.invoke(notes_prompt.format(text=full_text))
+            notes = result.content.strip()
 
         # Clean extra whitespace or blank lines
         clean_notes = re.sub(r"\n\s*\n", "\n\n", notes).strip()

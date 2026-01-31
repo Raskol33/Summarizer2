@@ -11,28 +11,55 @@ import os
 import json
 from datetime import datetime
 
+# Import LLM Factory and Config Migration
+from llm_factory import (
+    create_llm,
+    validate_api_key,
+    get_available_models,
+    get_default_model,
+    get_provider_display_name,
+    PROVIDER_MODELS
+)
+from migrate_config import migrate_config
+
+# Migrate config at startup
+migrate_config()
+
 # --------------------------- API KEY PERSISTENCE ---------------------------
 CONFIG_FILE = "config.json"
 
-def load_api_key():
-    """Load API key from config file."""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-                return config.get("groq_api_key", "")
-        except:
-            return ""
-    return ""
+def load_config():
+    """Load multi-provider configuration."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        from migrate_config import create_default_config
+        return create_default_config()
+    except json.JSONDecodeError:
+        return {}
 
-def save_api_key(api_key):
-    """Save API key to config file."""
+def save_config(config):
+    """Save complete configuration."""
     try:
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"groq_api_key": api_key}, f)
+            json.dump(config, f, indent=2)
         return True
-    except:
+    except Exception:
         return False
+
+def get_provider_config(config, provider):
+    """Get config for a specific provider."""
+    return config.get("providers", {}).get(provider, {})
+
+def update_provider_config(config, provider, updates):
+    """Update config for a specific provider."""
+    if "providers" not in config:
+        config["providers"] = {}
+    if provider not in config["providers"]:
+        config["providers"][provider] = {}
+    config["providers"][provider].update(updates)
+    return config
 
 def save_file_with_dialog(content, default_filename):
     """Save file using system dialog (tkinter)."""
@@ -67,6 +94,32 @@ def save_file_with_dialog(content, default_filename):
 
     except Exception as e:
         return False, str(e)
+
+def get_current_llm():
+    """
+    Get the current LLM instance with the latest configuration.
+    This ensures we always use the most recent API key and provider settings.
+    """
+    current_config = load_config()
+    current_provider = current_config.get("selected_provider", "groq")
+    current_provider_cfg = get_provider_config(current_config, current_provider)
+
+    if current_provider == "ollama":
+        return create_llm(
+            provider="ollama",
+            model=current_provider_cfg.get("model", "llama3.1:8b"),
+            base_url=current_provider_cfg.get("url", "http://localhost:11434")
+        )
+    else:
+        current_api_key = current_provider_cfg.get("api_key", "")
+        if not current_api_key or not validate_api_key(current_provider, current_api_key):
+            raise ValueError(f"Invalid or missing API key for {current_provider.upper()}")
+
+        return create_llm(
+            provider=current_provider,
+            api_key=current_api_key,
+            model=current_provider_cfg.get("model", get_default_model(current_provider))
+        )
 
 # --------------------------- TRANSLATIONS ---------------------------
 TRANSLATIONS = {
@@ -139,7 +192,25 @@ TRANSLATIONS = {
         "feature4_title": "🎬 Content Recommendations",
         "feature4_text": "Discover similar YouTube videos relevant to your summarized topic.",
         "tech_title": "🛠️ Main Technologies Used",
-        "ui_language": "🌐 Interface Language"
+        "ui_language": "🌐 Interface Language",
+        "llm_provider": "LLM Provider",
+        "choose_provider": "Choose your LLM provider",
+        "ollama_url": "Ollama Server URL",
+        "server_url": "Server URL",
+        "model": "Model",
+        "select_model": "Select model",
+        "test_connection": "Test Connection",
+        "save_config": "Save Configuration",
+        "get_api_key": "Get API Key →",
+        "provider_status": "📊 All Providers Status",
+        "enter_api_key": "Please enter an API key",
+        "invalid_api_key_format": "Invalid API key format",
+        "groq_key_help": "Format: gsk_xxxxx...",
+        "openai_key_help": "Format: sk-xxxxx...",
+        "claude_key_help": "Format: sk-ant-xxxxx...",
+        "mistral_key_help": "Format: xxxxx...",
+        "no_api_key": "No API key configured",
+        "invalid_api_key": "Invalid API key"
     },
     "Français": {
         "page_title": "Résumeur de Vidéos 🎬",
@@ -210,7 +281,25 @@ TRANSLATIONS = {
         "feature4_title": "🎬 Recommandations de Contenu",
         "feature4_text": "Découvrez des vidéos YouTube similaires pertinentes pour votre sujet résumé.",
         "tech_title": "🛠️ Technologies Principales Utilisées",
-        "ui_language": "🌐 Langue de l'Interface"
+        "ui_language": "🌐 Langue de l'Interface",
+        "llm_provider": "Fournisseur LLM",
+        "choose_provider": "Choisissez votre fournisseur LLM",
+        "ollama_url": "URL du serveur Ollama",
+        "server_url": "URL du serveur",
+        "model": "Modèle",
+        "select_model": "Sélectionnez le modèle",
+        "test_connection": "Tester la connexion",
+        "save_config": "Sauvegarder la configuration",
+        "get_api_key": "Obtenir une clé API →",
+        "provider_status": "📊 État de tous les fournisseurs",
+        "enter_api_key": "Veuillez entrer une clé API",
+        "invalid_api_key_format": "Format de clé API invalide",
+        "groq_key_help": "Format: gsk_xxxxx...",
+        "openai_key_help": "Format: sk-xxxxx...",
+        "claude_key_help": "Format: sk-ant-xxxxx...",
+        "mistral_key_help": "Format: xxxxx...",
+        "no_api_key": "Aucune clé API configurée",
+        "invalid_api_key": "Clé API invalide"
     }
 }
 
@@ -515,29 +604,149 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown(f"### ⚙️ {t('config')}")
+    st.markdown(f"### 🤖 {t('llm_provider')}")
 
-    # Load saved API key
-    saved_key = load_api_key()
-    groq_api_key = st.text_input(t("api_key"), type="password", value=saved_key)
+    # Load config
+    config = load_config()
+    current_provider = config.get("selected_provider", "groq")
 
-    # Save button
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        if st.button(f"💾 {t('save_key')}"):
-            if groq_api_key and groq_api_key.startswith("gsk_"):
-                if save_api_key(groq_api_key):
-                    st.success("✅ API Key saved!" if st.session_state.ui_language == "English" else "✅ Clé API sauvegardée !")
+    # Provider selector
+    provider_options = {
+        "groq": "Groq (Ultra-rapide avec LPU)",
+        "openai": "OpenAI (GPT-4)",
+        "claude": "Claude (Anthropic)",
+        "mistral": "Mistral AI",
+        "ollama": "Ollama (100% Local)"
+    }
+
+    selected_provider = st.selectbox(
+        t("choose_provider"),
+        options=list(provider_options.keys()),
+        format_func=lambda x: provider_options[x],
+        index=list(provider_options.keys()).index(current_provider),
+        key="provider_selector"
+    )
+
+    # Save selected provider
+    if selected_provider != current_provider:
+        config["selected_provider"] = selected_provider
+        save_config(config)
+
+    provider_cfg = get_provider_config(config, selected_provider)
+
+    # Provider-specific configuration
+    if selected_provider == "ollama":
+        # Ollama: URL + model (no API key)
+        st.markdown(f"**🌐 {t('ollama_url')}**")
+        ollama_url = st.text_input(
+            t("server_url"),
+            value=provider_cfg.get("url", "http://localhost:11434"),
+            key="ollama_url_input"
+        )
+
+        st.markdown(f"**🧠 {t('model')}**")
+        ollama_model = st.selectbox(
+            t("select_model"),
+            options=get_available_models("ollama"),
+            index=0 if not provider_cfg.get("model") else get_available_models("ollama").index(provider_cfg.get("model", "llama3.1:8b")),
+            key="ollama_model_select"
+        )
+
+        # Test Ollama connection
+        if st.button(t("test_connection")):
+            try:
+                import requests
+                response = requests.get(f"{ollama_url}/api/tags", timeout=5)
+                if response.status_code == 200:
+                    st.success("✅ Connexion réussie à Ollama!" if st.session_state.ui_language == "Français" else "✅ Connection successful to Ollama!")
                 else:
-                    st.error("❌ Failed to save key" if st.session_state.ui_language == "English" else "❌ Échec de la sauvegarde")
-            else:
-                st.warning("⚠️ Enter a valid Groq API key" if st.session_state.ui_language == "English" else "⚠️ Entrez une clé API Groq valide")
-    with col2:
-        if st.button(f"🗑️ {t('clear')}"):
-            save_api_key("")
-            st.rerun()
+                    st.error("❌ Impossible de se connecter à Ollama" if st.session_state.ui_language == "Français" else "❌ Unable to connect to Ollama")
+            except Exception as e:
+                st.error(f"❌ {t('error')} {e}")
 
-    st.markdown(f"{t('get_key')} [Groq Console](https://console.groq.com)")
+        # Save Ollama config
+        if st.button(t("save_config")):
+            config = update_provider_config(config, "ollama", {
+                "url": ollama_url,
+                "model": ollama_model
+            })
+            if save_config(config):
+                st.success("✅ Configuration sauvegardée!" if st.session_state.ui_language == "Français" else "✅ Configuration saved!")
+
+    else:
+        # Other providers: API key + model
+        st.markdown(f"**🔑 {t('api_key')}**")
+
+        # Show current status
+        current_key = provider_cfg.get("api_key", "")
+        if current_key and validate_api_key(selected_provider, current_key):
+            st.info(f"✅ Clé API configurée ({current_key[:8]}...)")
+        elif current_key:
+            st.warning(f"⚠️ Clé API présente mais format invalide")
+        else:
+            st.warning(f"⚠️ Aucune clé API configurée")
+
+        # Input for new/updated API key
+        api_key = st.text_input(
+            f"Nouvelle clé {selected_provider.upper()} API (ou laissez vide pour garder l'actuelle)",
+            type="password",
+            placeholder=f"Entrez votre clé API {selected_provider}...",
+            key=f"{selected_provider}_api_key_input",
+            help=t(f"{selected_provider}_key_help")
+        )
+
+        # If user didn't enter anything, use the existing key
+        if not api_key:
+            api_key = current_key
+
+        # Link to get API key
+        api_links = {
+            "groq": "https://console.groq.com/keys",
+            "openai": "https://platform.openai.com/api-keys",
+            "claude": "https://console.anthropic.com/",
+            "mistral": "https://console.mistral.ai/"
+        }
+        st.markdown(f"[{t('get_api_key')}]({api_links[selected_provider]})")
+
+        st.markdown(f"**🧠 {t('model')}**")
+        available_models = get_available_models(selected_provider)
+        current_model = provider_cfg.get("model", get_default_model(selected_provider))
+
+        model = st.selectbox(
+            t("select_model"),
+            options=available_models,
+            index=available_models.index(current_model) if current_model in available_models else 0,
+            key=f"{selected_provider}_model_select"
+        )
+
+        # Save button
+        if st.button(t("save_config"), key=f"save_btn_{selected_provider}"):
+            if api_key and validate_api_key(selected_provider, api_key):
+                # Reload config to avoid conflicts
+                fresh_config = load_config()
+                fresh_config = update_provider_config(fresh_config, selected_provider, {
+                    "api_key": api_key,
+                    "model": model
+                })
+                if save_config(fresh_config):
+                    st.success("✅ Configuration sauvegardée!" if st.session_state.ui_language == "Français" else "✅ Configuration saved!")
+                    # Force page reload to update all widgets
+                    st.rerun()
+            elif not api_key:
+                st.warning(t("enter_api_key"))
+            else:
+                st.error(t("invalid_api_key_format"))
+
+    # Show status of all providers
+    with st.expander(t("provider_status")):
+        for prov in ["groq", "openai", "claude", "mistral", "ollama"]:
+            prov_cfg = get_provider_config(config, prov)
+            if prov == "ollama":
+                status = "✅" if prov_cfg.get("url") else "⚠️"
+            else:
+                status = "✅" if prov_cfg.get("api_key") else "⚠️"
+            st.markdown(f"**{provider_options[prov]}**: {status}")
+
     st.divider()
 
     st.markdown(f"#### 🧠 {t('about')}")
@@ -564,11 +773,55 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# --- API KEY VALIDATION & LLM INITIALIZATION ---
-valid_api_key = groq_api_key.startswith("gsk_")
+# --- LLM INITIALIZATION ---
 llm = None
-if valid_api_key:
-    llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key)
+llm_ready = False
+error_message = None
+
+try:
+    config = load_config()
+    provider = config.get("selected_provider", "groq")
+    provider_cfg = get_provider_config(config, provider)
+
+    if provider == "ollama":
+        # Ollama: no API key needed
+        ollama_url = provider_cfg.get("url", "http://localhost:11434")
+        model = provider_cfg.get("model", "llama3.1:8b")
+
+        llm = create_llm(
+            provider="ollama",
+            model=model,
+            base_url=ollama_url
+        )
+        llm_ready = True
+
+    else:
+        # Other providers: need API key
+        api_key = provider_cfg.get("api_key", "")
+        model = provider_cfg.get("model", get_default_model(provider))
+
+        if api_key and validate_api_key(provider, api_key):
+            llm = create_llm(
+                provider=provider,
+                api_key=api_key,
+                model=model
+            )
+            llm_ready = True
+        elif api_key:
+            error_message = t("invalid_api_key")
+        else:
+            error_message = t("no_api_key")
+
+except Exception as e:
+    error_message = f"LLM initialization error: {str(e)}"
+    llm_ready = False
+
+# Display errors if needed
+if error_message and not llm_ready:
+    st.sidebar.error(error_message)
+
+# For backward compatibility
+valid_api_key = llm_ready
 # ----------------------------------------------
 
 
@@ -595,19 +848,24 @@ else:
 
 # Prompt for individual chunks (map step)
 map_prompt_template = """
+CRITICAL INSTRUCTION: You MUST write your summary in the SAME LANGUAGE as the content below. If the content is in French, write in French. If in English, write in English. DO NOT switch languages.
+
 Provide a detailed summary of the following content section. Capture all key points, important details, and main ideas:
 
 {text}
 
-DETAILED SUMMARY:
+DETAILED SUMMARY (in the same language as the content above):
 """
 map_prompt = PromptTemplate(template=map_prompt_template, input_variables=["text"])
 
 # Prompt for combining summaries (reduce step)
 combine_prompt_template = """
+CRITICAL INSTRUCTION: You MUST write your final summary in the SAME LANGUAGE as the summaries below. DO NOT translate or switch languages. Maintain the original language throughout.
+
 You are given multiple summaries from different sections of a video. Combine them into one comprehensive, well-structured summary.
 
 The final summary should:
+- Be written in the SAME LANGUAGE as the section summaries
 - Be proportional to the total content length and importance
 - Maintain logical flow and coherence
 - Capture all essential information from all sections
@@ -617,7 +875,7 @@ The final summary should:
 Section summaries:
 {text}
 
-FINAL COMPREHENSIVE SUMMARY:
+FINAL COMPREHENSIVE SUMMARY (in the same language as above):
 """
 combine_prompt = PromptTemplate(template=combine_prompt_template, input_variables=["text"])
 
@@ -636,6 +894,9 @@ if valid_api_key:
 
             with st.spinner(t("fetching")):
                 try:
+                    # IMPORTANT: Get current LLM with latest configuration
+                    current_llm = get_current_llm()
+
                     # Support for multiple languages - will try in order until one works
                     loader = YoutubeLoader.from_youtube_url(
                         youtube_url,
@@ -658,14 +919,14 @@ if valid_api_key:
 
                         # If the text is short enough, summarize directly
                         if len(full_text) < 3000:
-                            result = llm.invoke(map_prompt.format(text=full_text))
+                            result = current_llm.invoke(map_prompt.format(text=full_text))
                             summary = result.content.strip()
                         else:
                             # Summarize each chunk
                             chunk_summaries = []
                             progress_bar = st.progress(0)
                             for idx, chunk in enumerate(chunks):
-                                result = llm.invoke(map_prompt.format(text=chunk))
+                                result = current_llm.invoke(map_prompt.format(text=chunk))
                                 chunk_summaries.append(result.content.strip())
                                 progress_bar.progress((idx + 1) / len(chunks))
                             progress_bar.empty()
@@ -682,12 +943,12 @@ if valid_api_key:
 
                                 final_summaries = []
                                 for chunk in final_chunks:
-                                    result = llm.invoke(combine_prompt.format(text=chunk))
+                                    result = current_llm.invoke(combine_prompt.format(text=chunk))
                                     final_summaries.append(result.content.strip())
 
                                 summary = " ".join(final_summaries)
                             else:
-                                result = llm.invoke(combine_prompt.format(text=combined_text))
+                                result = current_llm.invoke(combine_prompt.format(text=combined_text))
                                 summary = result.content.strip()
                         st.session_state.summary = summary
                         st.session_state.docs = docs
@@ -838,12 +1099,35 @@ if st.session_state.summary:
         if st.button(f"{t('translate_btn')} {lang}", on_click=translate_action):
             with st.spinner(f"{t('translating')} {lang}..."):
                 try:
+                    # IMPORTANT: Get current LLM with latest configuration
+                    current_llm = get_current_llm()
+
                     t_prompt = PromptTemplate(
                         template="Translate the following text to {target_language} naturally and accurately. Preserve the meaning, tone, and structure:\n{text}",
                         input_variables=["text", "target_language"],
                     )
-                    result = llm.invoke(t_prompt.format(text=st.session_state.summary, target_language=lang))
-                    st.session_state.translation_output = result.content.strip()
+
+                    summary_text = st.session_state.summary
+
+                    # For long texts, chunk and translate
+                    if len(summary_text) > 3000:
+                        chunk_size = 2500
+                        chunks = []
+                        for i in range(0, len(summary_text), chunk_size):
+                            chunks.append(summary_text[i:i + chunk_size])
+
+                        translated_chunks = []
+                        progress_bar = st.progress(0)
+                        for idx, chunk in enumerate(chunks):
+                            result = current_llm.invoke(t_prompt.format(text=chunk, target_language=lang))
+                            translated_chunks.append(result.content.strip())
+                            progress_bar.progress((idx + 1) / len(chunks))
+                        progress_bar.empty()
+
+                        st.session_state.translation_output = " ".join(translated_chunks)
+                    else:
+                        result = current_llm.invoke(t_prompt.format(text=summary_text, target_language=lang))
+                        st.session_state.translation_output = result.content.strip()
                 except Exception as e:
                     st.warning(f"{t('translation_failed')} {e}")
 
@@ -871,6 +1155,9 @@ if st.session_state.summary:
         if st.button(t("generate_notes_btn"), on_click=notes_action, key='notes_btn'):
             with st.spinner(t("creating_notes")):
                 try:
+                    # IMPORTANT: Get current LLM with latest configuration
+                    current_llm = get_current_llm()
+
                     # Determine target language for notes
                     target_lang = st.session_state.translation_language if st.session_state.translation_language else "English"
 
@@ -1016,7 +1303,7 @@ if st.session_state.summary:
                     # If the text is short enough, generate notes directly
                     if len(full_text) < 3000:
                         final_prompt = PromptTemplate(template=final_notes_template, input_variables=["text"])
-                        result = llm.invoke(final_prompt.format(text=full_text))
+                        result = current_llm.invoke(final_prompt.format(text=full_text))
                         notes = result.content.strip()
                     else:
                         # Extract key info from each chunk
@@ -1024,7 +1311,7 @@ if st.session_state.summary:
                         chunk_summaries = []
                         progress_bar = st.progress(0)
                         for idx, chunk in enumerate(chunks):
-                            result = llm.invoke(chunk_prompt.format(text=chunk))
+                            result = current_llm.invoke(chunk_prompt.format(text=chunk))
                             chunk_summaries.append(result.content.strip())
                             progress_bar.progress((idx + 1) / len(chunks))
                         progress_bar.empty()
@@ -1034,7 +1321,7 @@ if st.session_state.summary:
 
                         # Generate final structured notes
                         final_prompt = PromptTemplate(template=final_notes_template, input_variables=["text"])
-                        result = llm.invoke(final_prompt.format(text=combined_text))
+                        result = current_llm.invoke(final_prompt.format(text=combined_text))
                         notes = result.content.strip()
 
                     st.session_state.notes_output = re.sub(r'\n\s*\n', '\n\n', notes).strip()
